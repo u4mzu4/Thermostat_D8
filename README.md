@@ -1,1 +1,1 @@
-Room thermostat on ESP32
+Room thermostat on ESP32-S3
