@@ -3,7 +3,6 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 
-
 #define RELAYPIN 9
 #define TIMEOUT 5000  //5 sec
 #define MITSUBISHIURL "https://app.melcloud.com/Mitsubishi.Wifi.Client/Device/Get?id="
@@ -22,12 +21,10 @@ enum HEAT_SM {
   RADIATOR_ON = 1,
 };
 
-float setValue = 22.49;
+float setValue = 21.99;
 bool failSafe = 0;
-float roomTempArray[DEVICENR];
 
-
-void MitsubishiReadRead() {
+void MitsubishiReadRead(float* roomTempArray) {
   JSONVar myJSONObject;
   String jsonBuffer = "{}";
   String mitsubishiUrl = "{}";
@@ -58,14 +55,13 @@ void MitsubishiReadRead() {
   }
 }
 
-void ManageHeating() {
+void ManageHeating(float actualValue) {
   static HEAT_SM heatState = OFF;
-  float roomTemp = FindMinimumTemp();
 
   switch (heatState) {
     case OFF:
       {
-        if (roomTemp < setValue) {
+        if (actualValue < setValue) {
           Serial.println("Heating ON!");
           heatState = RADIATOR_ON;
           digitalWrite(RELAYPIN, 1);
@@ -74,7 +70,7 @@ void ManageHeating() {
       }
     case RADIATOR_ON:
       {
-        if (roomTemp >= setValue) {
+        if (actualValue >= setValue) {
           Serial.println("Heating OFF!");
           digitalWrite(RELAYPIN, 0);
           heatState = OFF;
@@ -84,7 +80,7 @@ void ManageHeating() {
   }
 }
 
-float FindMinimumTemp() {
+float FindMinimumTemp(float* roomTempArray) {
   float minTemp = roomTempArray[0];
 
   for (int i = 0; i < DEVICENR; i++) {
@@ -95,6 +91,7 @@ float FindMinimumTemp() {
   Serial.print("MinTemp: ");
   Serial.println(minTemp);
   return minTemp;
+  //return roomTempArray[2];
 }
 
 void setup() {
@@ -119,9 +116,12 @@ void setup() {
   delay(1000);
 }
 
-
 void loop() {
-  MitsubishiReadRead();
-  ManageHeating();
+  float roomTempArray[DEVICENR];
+  float roomTemp;
+
+  MitsubishiReadRead(roomTempArray);
+  roomTemp = FindMinimumTemp(roomTempArray);
+  ManageHeating(roomTemp);
   delay(60000);
 }
