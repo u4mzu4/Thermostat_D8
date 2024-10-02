@@ -4,7 +4,8 @@
 #include <WiFi.h>
 
 #define RELAYPIN 9
-#define TIMEOUT 5000  //5 sec
+#define TIMEOUT 5000       //5 sec
+#define REFRESHTIME 60013  //1 min
 #define MITSUBISHIURL "https://app.melcloud.com/Mitsubishi.Wifi.Client/Device/Get?id="
 #define BUILDINGID "758916"
 #define DEVICEID0 "108572884"  //Lacko
@@ -90,8 +91,8 @@ float FindMinimumTemp(float* roomTempArray) {
   }
   Serial.print("MinTemp: ");
   Serial.println(minTemp);
-  return minTemp;
-  //return roomTempArray[2];
+  //return minTemp;
+  return roomTempArray[2];
 }
 
 void setup() {
@@ -119,9 +120,12 @@ void setup() {
 void loop() {
   float roomTempArray[DEVICENR];
   float roomTemp;
+  static unsigned long lastrefresh = millis() + REFRESHTIME + 1;
 
-  MitsubishiReadRead(roomTempArray);
-  roomTemp = FindMinimumTemp(roomTempArray);
-  ManageHeating(roomTemp);
-  delay(60000);
+  if ((millis() - lastrefresh) > REFRESHTIME) {
+    MitsubishiReadRead(roomTempArray);
+    roomTemp = FindMinimumTemp(roomTempArray);
+    ManageHeating(roomTemp);
+    lastrefresh = millis();
+  }
 }
