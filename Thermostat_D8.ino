@@ -2,10 +2,8 @@
 #include <credentials_d8.h>
 #include <ElegantOTA.h>
 #include <ESPAsyncWebServer.h>
-#include <HTTPClient.h>
 #include <InfluxDbClient.h>
 #include <Ticker.h>
-#include <time.h>
 #include <WiFi.h>
 
 #define RELAYPIN 9
@@ -19,13 +17,8 @@
 #define DEVICEID3 "121235548"  //Haloszoba
 #define DEVICENR 4             //Number of devices
 #define INVALIDTEMP 99.9f      //Invalid roomtemperature
-#define NTPSERVER "hu.pool.ntp.org"
-#define TIMEZONE "CET-1CEST,M3.5.0,M10.5.0/3"
-#define WRITE_PRECISION WritePrecision::S
-#define MAX_BATCH_SIZE 7
-#define WRITE_BUFFER_SIZE 14
 
-#define DEBUG_PRINT 1  // SET TO 0 OUT TO REMOVE TRACES
+#define DEBUG_PRINT 0  // SET TO 0 OUT TO REMOVE TRACES
 #if DEBUG_PRINT
 #define D_SerialBegin(...) Serial.begin(__VA_ARGS__);
 #define D_print(...) Serial.print(__VA_ARGS__)
@@ -38,7 +31,6 @@
 
 //Init services
 AsyncWebServer server(80);
-HTTPClient hclient;
 Ticker mainTimer;
 InfluxDBClient influxclient(influxdb_URL, influxdb_ORG, influxdb_BUCKET, influxdb_TOKEN);
 
@@ -69,34 +61,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     <input type="submit" value="Submit">
   </form>
 </body></html>)rawliteral";
-
-void MitsubishiRead() {
-  JSONVar myJSONObject;
-  String jsonBuffer = "{}";
-  String mitsubishiUrl = "{}";
-  static String deviceIDs[DEVICENR] = { DEVICEID0, DEVICEID1, DEVICEID2, DEVICEID3 };
-
-  for (int i = 0; i < DEVICENR; i++) {
-    mitsubishiUrl = MITSUBISHIURL;
-    mitsubishiUrl += deviceIDs[i];
-    mitsubishiUrl += "&buildingID=";
-    mitsubishiUrl += BUILDINGID;
-    //D_println(mitsubishiUrl);
-
-    hclient.begin(mitsubishiUrl);
-    hclient.addHeader("X-MitsContextKey", contextKey);
-    hclient.setConnectTimeout(TIMEOUT);
-    if (HTTP_CODE_OK == hclient.GET()) {
-      jsonBuffer = hclient.getString();
-      myJSONObject = JSON.parse(jsonBuffer);
-      roomTempArray[i] = (float)(double)(myJSONObject["RoomTemperature"]);
-    } else {
-      D_println("HTTP code failed");
-      roomTempArray[i] = INVALIDTEMP;
-    }
-    hclient.end();
-  }
-}
 
 void ManageHeating(float actualValue) {
   static HEAT_SM heatState = OFF;
@@ -142,11 +106,12 @@ float FindMinimumTemp() {
 
 void MainTask() {
   InfluxBatchReader();
-  //MitsubishiRead();
   D_println("InfluxDBRead finished!");
   roomTemp = FindMinimumTemp();
   ManageHeating(roomTemp);
-  //InfluxBatchWriter();
+  InfluxWriter("set", "Celsius", "setValue", setValue);  //to be remove
+  InfluxWriter("status", "bool", "boilerON", (float)boilerON);
+  InfluxWriter("measurement", "Celsius", "roomTemp", roomTemp);
 }
 
 // Replaces placeholder with stored values
@@ -156,70 +121,37 @@ String processor(const String &var) {
   }
 }
 
-void InfluxBatchWriter() {
+void InfluxWriter(String dataType, String dataUnit, String dataString, float dataPoint) {
+  Point influxPoint("thermostat");
 
-  unsigned long tnow;
-  float boilerON_f = (float)boilerON;
-
-  String influxDataType[MAX_BATCH_SIZE] = { "meas", "meas", "meas", "meas", "meas", "status", "set" };
-  String influxDataUnit[MAX_BATCH_SIZE] = { "Celsius", "Celsius", "Celsius", "Celsius", "Celsius", "bool", "Celsius" };
-  String influxFieldName[MAX_BATCH_SIZE] = { "roomTempArray0", "roomTempArray1", "roomTempArray2", "roomTempArray3", "roomTemp", "boilerON", "setValue" };
-  float *influxFieldValue[MAX_BATCH_SIZE] = { &roomTempArray[0], &roomTempArray[1], &roomTempArray[2], &roomTempArray[3], &roomTemp, &boilerON_f, &setValue };
-
-
-  if (influxclient.isBufferEmpty()) {
-    tnow = GetEpochTime();
-    for (int i = 0; i < MAX_BATCH_SIZE; i++) {
-      Point influxBatchPoint("thermostat");
-      influxBatchPoint.addTag("data_type", influxDataType[i]);
-      influxBatchPoint.addTag("data_unit", influxDataUnit[i]);
-      influxBatchPoint.addField(influxFieldName[i], *(influxFieldValue[i]));
-      influxBatchPoint.setTime(tnow);
-      influxclient.writePoint(influxBatchPoint);
-    }
-    influxclient.flushBuffer();
-    D_println("Influx batchpoint written!");
-  } else {
-    Point influxBatchPoint("thermostat");
-    influxBatchPoint.clearFields();
-    influxclient.flushBuffer();
-    D_println("Influx batchpoint cleared!");
-  }
+  influxPoint.addTag("data_type", dataType);
+  influxPoint.addTag("data_unit", dataUnit);
+  influxPoint.addField(dataString, dataPoint);
+  influxclient.writePoint(influxPoint);
 }
 
 void InfluxBatchReader() {
-  int queryCount = 0;
+  int queryIndex = 0;
 
-  String query1 = "from(bucket: \"thermo_data\") |> range(start: -3h, stop:now()) |> filter(fn: (r) => r[\"_field\"] == \"RoomTemperature\") |> last()";
+  String query1 = "from(bucket: \"thermo_data\") |> range(start: -2m, stop:now()) |> filter(fn: (r) => r[\"_field\"] == \"RoomTemperature\") |> last()";
   //String query2 = "from(bucket: \"thermo_data\") |> range(start: -2m, stop:now()) |> filter(fn: (r) => r[\"_measurement\"] == \"mitsubishi\" and r[\"location\"] == \"Haloszoba\") |> last()";
   //String query3 = "from(bucket: \"thermo_data\") |> range(start: -2m, stop:now()) |> filter(fn: (r) => r[\"_measurement\"] == \"mitsubishi\" and r[\"location\"] == \"Haloszoba\") |> last()";
   //String query4 = "from(bucket: \"thermo_data\") |> range(start: -2m, stop:now()) |> filter(fn: (r) => r[\"_measurement\"] == \"mitsubishi\" and r[\"location\"] == \"Haloszoba\") |> last()";
 
   FluxQueryResult result = influxclient.query(query1);
   while (result.next()) {
-    roomTempArray[queryCount] = result.getValueByName("_value").getDouble();
+    roomTempArray[queryIndex] = result.getValueByName("_value").getDouble();
     D_print("Influx batchpoint read: ");
-    D_println(roomTempArray[queryCount]);
-    queryCount++;
+    D_println(roomTempArray[queryIndex]);
+    queryIndex++;
   }
   result.close();
-}
-
-unsigned long GetEpochTime() {
-  time_t now;
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    return (0);
-  }
-  time(&now);
-  return now;
 }
 
 void setup() {
   D_SerialBegin(115200);
   delay(100);
   pinMode(RELAYPIN, OUTPUT);
-  hclient.setReuse(true);
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid_o, password_o);
@@ -250,12 +182,11 @@ void setup() {
   });
   ElegantOTA.begin(&server);  // Start ElegantOTA
   server.begin();
-  configTzTime(TIMEZONE, NTPSERVER);
-  influxclient.setWriteOptions(WriteOptions().writePrecision(WRITE_PRECISION).batchSize(MAX_BATCH_SIZE).bufferSize(WRITE_BUFFER_SIZE));
   influxclient.validateConnection();
 
   mainTimer.attach_ms(REFRESHTIME, MainTask);
 }
 
 void loop() {
+  ElegantOTA.loop();
 }
