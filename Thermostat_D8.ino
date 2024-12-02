@@ -2,6 +2,7 @@
 #include <credentials_d8.h>
 #include <ElegantOTA.h>
 #include <ESPAsyncWebServer.h>
+#include <HTTPClient.h>
 #include <InfluxDbClient.h>
 #include <Ticker.h>
 #include <WiFi.h>
@@ -9,14 +10,9 @@
 #define RELAYPIN 9
 #define TIMEOUT 5000       //5 sec
 #define REFRESHTIME 60013  //1 min
-#define MITSUBISHIURL "https://app.melcloud.com/Mitsubishi.Wifi.Client/Device/Get?id="
-#define BUILDINGID "758916"
-#define DEVICEID0 "108572884"  //Lacko
-#define DEVICEID1 "109414188"  //Nappali
-#define DEVICEID2 "120563034"  //Kinga
-#define DEVICEID3 "121235548"  //Haloszoba
-#define DEVICENR 4             //Number of devices
-#define INVALIDTEMP 99.9f      //Invalid roomtemperature
+#define DEVICENR 4         //Number of devices
+#define INVALIDTEMP 99.9f  //Invalid roomtemperature
+#define SHELLYURL "http://192.168.1.210/rpc/Thermostat.SetConfig?id=0&config={\"target_C\":"
 
 #define DEBUG_PRINT 0  // SET TO 0 OUT TO REMOVE TRACES
 #if DEBUG_PRINT
@@ -93,10 +89,8 @@ float FindMinimumTemp() {
   float minTemp = roomTempArray[0];
 
   for (int i = 0; i < DEVICENR; i++) {
-    if (i != 2) {
-      if (roomTempArray[i] < minTemp) {
-        minTemp = roomTempArray[i];
-      }
+    if (roomTempArray[i] < minTemp) {
+      minTemp = roomTempArray[i];
     }
   }
   D_print("MinTemp: ");
@@ -109,7 +103,6 @@ void MainTask() {
   D_println("InfluxDBRead finished!");
   roomTemp = FindMinimumTemp();
   ManageHeating(roomTemp);
-  InfluxWriter("set", "Celsius", "setValue", setValue);  //to be remove
   InfluxWriter("status", "bool", "boilerON", (float)boilerON);
   InfluxWriter("measurement", "Celsius", "roomTemp", roomTemp);
 }
@@ -133,10 +126,8 @@ void InfluxWriter(String dataType, String dataUnit, String dataString, float dat
 void InfluxBatchReader() {
   int queryIndex = 0;
 
-  String query1 = "from(bucket: \"thermo_data\") |> range(start: -2m, stop:now()) |> filter(fn: (r) => r[\"_field\"] == \"RoomTemperature\") |> last()";
-  //String query2 = "from(bucket: \"thermo_data\") |> range(start: -2m, stop:now()) |> filter(fn: (r) => r[\"_measurement\"] == \"mitsubishi\" and r[\"location\"] == \"Haloszoba\") |> last()";
-  //String query3 = "from(bucket: \"thermo_data\") |> range(start: -2m, stop:now()) |> filter(fn: (r) => r[\"_measurement\"] == \"mitsubishi\" and r[\"location\"] == \"Haloszoba\") |> last()";
-  //String query4 = "from(bucket: \"thermo_data\") |> range(start: -2m, stop:now()) |> filter(fn: (r) => r[\"_measurement\"] == \"mitsubishi\" and r[\"location\"] == \"Haloszoba\") |> last()";
+  String query1 = "from(bucket: \"thermo_data\") |> range(start: -5m, stop:now()) |> filter(fn: (r) => r[\"_field\"] == \"RoomTemperature\") |> last()";
+  String query2 = "from(bucket: \"thermo_data\") |> range(start: -5m, stop:now()) |> filter(fn: (r) => r[\"_measurement\"] == \"thermostat\" and r[\"_field\"] == \"setValue\") |> last()";
 
   FluxQueryResult result = influxclient.query(query1);
   while (result.next()) {
@@ -146,7 +137,33 @@ void InfluxBatchReader() {
     queryIndex++;
   }
   result.close();
+
+  result = influxclient.query(query2);
+  while (result.next()) {
+    setValue = result.getValueByName("_value").getDouble();
+    if ((setValue < 18.0) || (setValue > 25.5)) {
+      setValue = 21.99;
+    }
+    D_print("Influx setValue read: ");
+    D_println(setValue);
+  }
+  result.close();
 }
+
+int WriteShelly(String setString) {
+  HTTPClient hclient;
+
+  String host = SHELLYURL + setString + "}";
+  hclient.begin(host);
+  hclient.setConnectTimeout(5000);
+  if (HTTP_CODE_OK == hclient.GET()) {
+    return HTTP_CODE_OK;
+  } else {
+    return -1;
+  }
+  hclient.end();
+}
+
 
 void setup() {
   D_SerialBegin(115200);
@@ -177,6 +194,7 @@ void setup() {
       setValue = request->getParam("input")->value().toFloat();
       setValue -= 0.01;
       inputString = String(setValue, 1);
+      WriteShelly(inputString);
     }
     request->redirect("/");
   });
