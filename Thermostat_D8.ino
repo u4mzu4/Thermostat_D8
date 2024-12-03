@@ -10,7 +10,7 @@
 #define RELAYPIN 9
 #define TIMEOUT 5000       //5 sec
 #define REFRESHTIME 60013  //1 min
-#define DEVICENR 4         //Number of devices
+#define DEVICENR 5         //Number of devices
 #define INVALIDTEMP 99.9f  //Invalid roomtemperature
 #define SHELLYURL "http://192.168.1.210/rpc/Thermostat.SetConfig?id=0&config={\"target_C\":"
 
@@ -43,7 +43,7 @@ bool failSafe = 0;
 String inputString = String(setValue, 1);
 float outsideTemp;
 bool boilerON;
-float roomTempArray[DEVICENR] = { INVALIDTEMP, INVALIDTEMP, INVALIDTEMP, INVALIDTEMP };
+float roomTempArray[DEVICENR] = { INVALIDTEMP, INVALIDTEMP, INVALIDTEMP, INVALIDTEMP, INVALIDTEMP };
 float roomTemp;
 
 // HTML web page to handle input field (input)
