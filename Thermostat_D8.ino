@@ -40,7 +40,6 @@ enum HEAT_SM {
 //Global variables
 float setValue = 21.99;
 bool failSafe = 0;
-String inputString = String(setValue, 1);
 float outsideTemp;
 bool boilerON;
 float roomTempArray[DEVICENR] = { INVALIDTEMP, INVALIDTEMP, INVALIDTEMP, INVALIDTEMP, INVALIDTEMP };
@@ -110,7 +109,7 @@ void MainTask() {
 // Replaces placeholder with stored values
 String processor(const String &var) {
   if (var == "inputString") {
-    return inputString;
+    return (String(setValue, 1));
   }
 }
 
@@ -164,7 +163,6 @@ int WriteShelly(String setString) {
   hclient.end();
 }
 
-
 void setup() {
   D_SerialBegin(115200);
   delay(100);
@@ -193,8 +191,7 @@ void setup() {
     if (request->hasParam("input")) {
       setValue = request->getParam("input")->value().toFloat();
       setValue -= 0.01;
-      inputString = String(setValue, 1);
-      WriteShelly(inputString);
+      WriteShelly(String(setValue, 1));
     }
     request->redirect("/");
   });
