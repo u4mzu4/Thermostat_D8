@@ -2,7 +2,6 @@
 #include <credentials_d8.h>
 #include <ElegantOTA.h>
 #include <ESPAsyncWebServer.h>
-#include <HTTPClient.h>
 #include <InfluxDbClient.h>
 #include <Ticker.h>
 #include <WiFi.h>
@@ -10,9 +9,13 @@
 #define RELAYPIN 9
 #define TIMEOUT 5000       //5 sec
 #define REFRESHTIME 60013  //1 min
-#define DEVICENR 5         //Number of devices
+#define DEVICENR 5         //Number of devices (4x MELCloud + 1x ThermoDisplay/BLU H&T)
 #define INVALIDTEMP 99.9f  //Invalid roomtemperature
-#define SHELLYURL "http://192.168.1.210/rpc/Thermostat.SetConfig?id=0&config={\"target_C\":"
+// Setpoint validity. The ThermoDisplay app writes X.49/X.99 values (shown 18.0 .. 25.5 -> stored 17.99 .. 25.49);
+// Holiday mode is 17.99, so the lower bound is 17.5 (was 18.0). See ARCHITECTURE.md.
+#define SETVALUE_MIN 17.5f
+#define SETVALUE_MAX 25.5f
+#define SETVALUE_DEFAULT 21.99f
 
 #define DEBUG_PRINT 0  // SET TO 0 OUT TO REMOVE TRACES
 #if DEBUG_PRINT
@@ -38,7 +41,7 @@ enum HEAT_SM {
 };
 
 //Global variables
-float setValue = 21.99;
+float setValue = SETVALUE_DEFAULT;
 bool failSafe = 0;
 float outsideTemp;
 bool boilerON;
@@ -55,6 +58,9 @@ const char index_html[] PROGMEM = R"rawliteral(
     SET: (Actual value: %inputString%) <input type="number" name="input" min="18" max="25.5" step="0.5">
     <input type="submit" value="Submit">
   </form>
+  <p>Room (min of %devices% sensors): %roomTemp% &deg;C &middot; Boiler: %boiler%</p>
+  <p><small>The setpoint is owned by the ThermoDisplay (Influx <code>thermostat,location=Shelly setValue</code>);
+  a value submitted here is written to Influx and the display adopts it.</small></p>
 </body></html>)rawliteral";
 
 void ManageHeating(float actualValue) {
@@ -109,8 +115,18 @@ void MainTask() {
 // Replaces placeholder with stored values
 String processor(const String &var) {
   if (var == "inputString") {
-    return (String(setValue, 1));
+    return (String(setValue, 2));
   }
+  if (var == "roomTemp") {
+    return (roomTemp >= INVALIDTEMP) ? String("n/a") : String(roomTemp, 1);
+  }
+  if (var == "boiler") {
+    return boilerON ? String("ON") : String("off");
+  }
+  if (var == "devices") {
+    return String(DEVICENR);
+  }
+  return String();
 }
 
 void InfluxWriter(String dataType, String dataUnit, String dataString, float dataPoint) {
@@ -122,14 +138,36 @@ void InfluxWriter(String dataType, String dataUnit, String dataString, float dat
   influxclient.writePoint(influxPoint);
 }
 
+// Setpoint written by the web form: the same series the ThermoDisplay app owns
+// (thermostat,location=Shelly setValue). The display polls it and adopts a newer external value.
+bool InfluxWriteSetValue(float value) {
+  Point influxPoint("thermostat");
+
+  influxPoint.addTag("location", "Shelly");
+  influxPoint.addField("setValue", value);
+  return influxclient.writePoint(influxPoint);
+}
+
 void InfluxBatchReader() {
   int queryIndex = 0;
 
+  // RoomTemperature: one series per room (4x mitsubishi + thermostat,location=Shelly) -> last() per series.
   String query1 = "from(bucket: \"thermo_data\") |> range(start: -5m, stop:now()) |> filter(fn: (r) => r[\"_field\"] == \"RoomTemperature\") |> last()";
-  String query2 = "from(bucket: \"thermo_data\") |> range(start: -5m, stop:now()) |> filter(fn: (r) => r[\"_measurement\"] == \"thermostat\" and r[\"_field\"] == \"setValue\") |> last()";
+  // setValue: a single value regardless of how many series carry it -> group() before last().
+  String query2 = "from(bucket: \"thermo_data\") |> range(start: -5m, stop:now()) |> filter(fn: (r) => r[\"_measurement\"] == \"thermostat\" and r[\"_field\"] == \"setValue\") |> group() |> last()";
+
+  // A room that stopped reporting (no point in the last 5 min) must not keep its stale value:
+  // INVALIDTEMP is ignored by the minimum search, and with every room missing the heating stays off.
+  for (int i = 0; i < DEVICENR; i++) {
+    roomTempArray[i] = INVALIDTEMP;
+  }
 
   FluxQueryResult result = influxclient.query(query1);
   while (result.next()) {
+    if (queryIndex >= DEVICENR) {  // bounds check: more series than expected -> ignore the extras
+      D_println("Influx: more RoomTemperature series than DEVICENR, extra ignored");
+      break;
+    }
     roomTempArray[queryIndex] = result.getValueByName("_value").getDouble();
     D_print("Influx batchpoint read: ");
     D_println(roomTempArray[queryIndex]);
@@ -140,27 +178,13 @@ void InfluxBatchReader() {
   result = influxclient.query(query2);
   while (result.next()) {
     setValue = result.getValueByName("_value").getDouble();
-    if ((setValue < 18.0) || (setValue > 25.5)) {
-      setValue = 21.99;
+    if ((setValue < SETVALUE_MIN) || (setValue > SETVALUE_MAX)) {
+      setValue = SETVALUE_DEFAULT;
     }
     D_print("Influx setValue read: ");
     D_println(setValue);
   }
   result.close();
-}
-
-int WriteShelly(String setString) {
-  HTTPClient hclient;
-
-  String host = SHELLYURL + setString + "}";
-  hclient.begin(host);
-  hclient.setConnectTimeout(5000);
-  if (HTTP_CODE_OK == hclient.GET()) {
-    return HTTP_CODE_OK;
-  } else {
-    return -1;
-  }
-  hclient.end();
 }
 
 void setup() {
@@ -187,11 +211,14 @@ void setup() {
   });
   // Send a GET request to <ESP_IP>/get?input=<inputValue>
   server.on("/get", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // GET input value on <ESP_IP>/get?input=<inputValue>
+    // GET input value on <ESP_IP>/get?input=<inputValue>  (shown value, 18.0 .. 25.5 step 0.5)
     if (request->hasParam("input")) {
-      setValue = request->getParam("input")->value().toFloat();
-      setValue -= 0.01;
-      WriteShelly(String(setValue, 1));
+      float shown = request->getParam("input")->value().toFloat();
+      float internal = shown - 0.01f;  // X.49 / X.99 convention, same as the display
+      if ((internal >= SETVALUE_MIN) && (internal <= SETVALUE_MAX)) {
+        setValue = internal;
+        InfluxWriteSetValue(setValue);
+      }
     }
     request->redirect("/");
   });
