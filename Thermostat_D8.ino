@@ -46,7 +46,7 @@ bool failSafe = 0;
 float outsideTemp;
 bool boilerON;
 float roomTempArray[DEVICENR] = { INVALIDTEMP, INVALIDTEMP, INVALIDTEMP, INVALIDTEMP, INVALIDTEMP };
-float roomTemp;
+float roomTemp = INVALIDTEMP;  // "n/a" on the web page until the first Influx read
 
 // HTML web page to handle input field (input)
 const char index_html[] PROGMEM = R"rawliteral(
