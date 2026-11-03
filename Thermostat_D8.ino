@@ -55,6 +55,11 @@ unsigned long lastMainTask;
 unsigned long lastInfluxOk;
 unsigned long lastWifiOk;
 bool resetReasonSent = false;
+// Diagnostics for /status
+String lastQueryError;
+int lastRoomRows = -1;
+unsigned long queryOkCount = 0;
+unsigned long queryFailCount = 0;
 
 // HTML web page to handle input field (input)
 const char index_html[] PROGMEM = R"rawliteral(
@@ -195,7 +200,11 @@ bool InfluxBatchReader() {
     D_println(roomTempArray[queryIndex]);
     queryIndex++;
   }
-  ok &= (result.getError().length() == 0);
+  lastRoomRows = queryIndex;
+  if (result.getError().length()) {
+    lastQueryError = "rooms: " + result.getError();
+    ok = false;
+  }
   result.close();
 
   result = influxclient.query(query2);
@@ -207,8 +216,12 @@ bool InfluxBatchReader() {
     D_print("Influx setValue read: ");
     D_println(setValue);
   }
-  ok &= (result.getError().length() == 0);
+  if (result.getError().length()) {
+    lastQueryError = "setValue: " + result.getError();
+    ok = false;
+  }
   result.close();
+  if (ok) queryOkCount++; else queryFailCount++;
   return ok;
 }
 
@@ -231,6 +244,20 @@ void setup() {
   D_println(WiFi.localIP());
   delay(100);
   // Send web page with input field to client
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String s = "build " __DATE__ " " __TIME__;
+    s += "\nuptime_s " + String(millis() / 1000);
+    s += "\nresetReason " + String((int)esp_reset_reason());
+    s += "\nrssi " + String(WiFi.RSSI());
+    s += "\nroomRows " + String(lastRoomRows);
+    s += "\nroomTemp " + String(roomTemp, 2);
+    s += "\nsetValue " + String(setValue, 2);
+    s += "\nboilerON " + String(boilerON);
+    s += "\nqueryOk " + String(queryOkCount) + " queryFail " + String(queryFailCount);
+    s += "\nlastQueryError " + lastQueryError;
+    s += "\nlastWriteError " + influxclient.getLastErrorMessage();
+    request->send(200, "text/plain", s);
+  });
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", index_html, processor);
   });
@@ -273,6 +300,7 @@ void loop() {
   if (now - lastMainTask >= REFRESHTIME) {
     lastMainTask = now;
     MainTask();
+    now = millis();  // MainTask sets lastInfluxOk later than the old 'now': unsigned now - lastInfluxOk would wrap
   }
 
   if (WiFi.status() == WL_CONNECTED) {
