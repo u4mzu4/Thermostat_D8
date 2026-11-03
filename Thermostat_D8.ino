@@ -112,10 +112,15 @@ float FindMinimumTemp() {
 }
 
 void MainTask() {
-  InfluxBatchReader();
-  D_println("InfluxDBRead finished!");
-  roomTemp = FindMinimumTemp();
-  ManageHeating(roomTemp);
+  // A failed query (timeout on a bad WiFi link) is not "every room missing": keep the last room
+  // temperature and relay state instead of switching the heating off for this cycle.
+  if (InfluxBatchReader()) {
+    D_println("InfluxDBRead finished!");
+    roomTemp = FindMinimumTemp();
+    ManageHeating(roomTemp);
+  } else {
+    D_println("InfluxDBRead failed, heating state kept");
+  }
   bool ok = InfluxWriter("status", "bool", "boilerON", (float)boilerON);
   ok &= InfluxWriter("measurement", "Celsius", "roomTemp", roomTemp);
   if (ok) {
@@ -163,8 +168,10 @@ bool InfluxWriteSetValue(float value) {
   return influxclient.writePoint(influxPoint);
 }
 
-void InfluxBatchReader() {
+// Returns false if a query failed (HTTP/parse error); setValue is then left unchanged as well.
+bool InfluxBatchReader() {
   int queryIndex = 0;
+  bool ok = true;
 
   // RoomTemperature: one series per room (4x mitsubishi + thermostat,location=Shelly) -> last() per series.
   String query1 = "from(bucket: \"thermo_data\") |> range(start: -5m, stop:now()) |> filter(fn: (r) => r[\"_field\"] == \"RoomTemperature\") |> last()";
@@ -188,6 +195,7 @@ void InfluxBatchReader() {
     D_println(roomTempArray[queryIndex]);
     queryIndex++;
   }
+  ok &= (result.getError().length() == 0);
   result.close();
 
   result = influxclient.query(query2);
@@ -199,7 +207,9 @@ void InfluxBatchReader() {
     D_print("Influx setValue read: ");
     D_println(setValue);
   }
+  ok &= (result.getError().length() == 0);
   result.close();
+  return ok;
 }
 
 void setup() {
@@ -208,6 +218,7 @@ void setup() {
   pinMode(RELAYPIN, OUTPUT);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // modem sleep gave 1-3 s ping times and Influx query timeouts
   WiFi.begin(ssid_o, password_o);
 
   // Wait for connection. No early return on failure: the server and the main cycle are set up anyway,
@@ -238,6 +249,7 @@ void setup() {
   });
   ElegantOTA.begin(&server);  // Start ElegantOTA
   server.begin();
+  influxclient.setHTTPOptions(HTTPOptions().httpReadTimeout(15000));  // default 5 s is too short on this link
   influxclient.validateConnection();
 
   // Task watchdog on the loop task (the Arduino core may have initialized the TWDT already -> reconfigure).
