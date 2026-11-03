@@ -3,12 +3,17 @@
 #include <ElegantOTA.h>
 #include <ESPAsyncWebServer.h>
 #include <InfluxDbClient.h>
-#include <Ticker.h>
 #include <WiFi.h>
+#include <esp_task_wdt.h>
 
 #define RELAYPIN 9
 #define TIMEOUT 5000       //5 sec
 #define REFRESHTIME 60013  //1 min
+// Self-healing: a hung loop (watchdog) or a lost Influx/WiFi link restarts the ESP; the relay is off
+// until the first cycle after boot, then follows the setpoint again.
+#define WDT_TIMEOUT_MS 120000       //2 min without loop() -> panic + restart
+#define INFLUX_DOWN_RESTART 900000  //15 min without a successful Influx write -> restart
+#define WIFI_DOWN_RESTART 300000    //5 min without WiFi -> restart
 #define DEVICENR 5         //Number of devices (4x MELCloud + 1x ThermoDisplay/BLU H&T)
 #define INVALIDTEMP 99.9f  //Invalid roomtemperature
 // Setpoint validity. The ThermoDisplay app writes X.49/X.99 values (shown 18.0 .. 25.5 -> stored 17.99 .. 25.49);
@@ -30,7 +35,6 @@
 
 //Init services
 AsyncWebServer server(80);
-Ticker mainTimer;
 InfluxDBClient influxclient(influxdb_URL, influxdb_ORG, influxdb_BUCKET, influxdb_TOKEN);
 
 
@@ -47,6 +51,10 @@ float outsideTemp;
 bool boilerON;
 float roomTempArray[DEVICENR] = { INVALIDTEMP, INVALIDTEMP, INVALIDTEMP, INVALIDTEMP, INVALIDTEMP };
 float roomTemp = INVALIDTEMP;  // "n/a" on the web page until the first Influx read
+unsigned long lastMainTask;
+unsigned long lastInfluxOk;
+unsigned long lastWifiOk;
+bool resetReasonSent = false;
 
 // HTML web page to handle input field (input)
 const char index_html[] PROGMEM = R"rawliteral(
@@ -108,8 +116,15 @@ void MainTask() {
   D_println("InfluxDBRead finished!");
   roomTemp = FindMinimumTemp();
   ManageHeating(roomTemp);
-  InfluxWriter("status", "bool", "boilerON", (float)boilerON);
-  InfluxWriter("measurement", "Celsius", "roomTemp", roomTemp);
+  bool ok = InfluxWriter("status", "bool", "boilerON", (float)boilerON);
+  ok &= InfluxWriter("measurement", "Celsius", "roomTemp", roomTemp);
+  if (ok) {
+    lastInfluxOk = millis();
+    // Once per boot: why did we start (esp_reset_reason_t, e.g. 1 power-on, 4 panic, 5 int. WDT, 6 task WDT, 3 restart)
+    if (!resetReasonSent) {
+      resetReasonSent = InfluxWriter("status", "code", "resetReason", (float)esp_reset_reason());
+    }
+  }
 }
 
 // Replaces placeholder with stored values
@@ -129,13 +144,13 @@ String processor(const String &var) {
   return String();
 }
 
-void InfluxWriter(String dataType, String dataUnit, String dataString, float dataPoint) {
+bool InfluxWriter(String dataType, String dataUnit, String dataString, float dataPoint) {
   Point influxPoint("thermostat");
 
   influxPoint.addTag("data_type", dataType);
   influxPoint.addTag("data_unit", dataUnit);
   influxPoint.addField(dataString, dataPoint);
-  influxclient.writePoint(influxPoint);
+  return influxclient.writePoint(influxPoint);
 }
 
 // Setpoint written by the web form: the same series the ThermoDisplay app owns
@@ -195,11 +210,10 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid_o, password_o);
 
-  // Wait for connection
-  unsigned long wifitimeout = millis();
+  // Wait for connection. No early return on failure: the server and the main cycle are set up anyway,
+  // WiFi keeps reconnecting in the background, and loop() restarts the ESP if it stays down.
   if (WiFi.waitForConnectResult(TIMEOUT) != WL_CONNECTED) {
     D_println("WiFi Failed!");
-    return;
   }
   D_println("Wifi connected");
   D_print("IP Address: ");
@@ -226,9 +240,38 @@ void setup() {
   server.begin();
   influxclient.validateConnection();
 
-  mainTimer.attach_ms(REFRESHTIME, MainTask);
+  // Task watchdog on the loop task (the Arduino core may have initialized the TWDT already -> reconfigure).
+  // Core 0 idle is watched too, so a task spinning there (WiFi/AsyncTCP) also ends in a restart.
+  esp_task_wdt_config_t wdtConfig = { .timeout_ms = WDT_TIMEOUT_MS, .idle_core_mask = (1 << 0), .trigger_panic = true };
+  if (esp_task_wdt_reconfigure(&wdtConfig) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_init(&wdtConfig);
+  }
+  esp_task_wdt_add(NULL);
+
+  lastMainTask = lastInfluxOk = lastWifiOk = millis();
 }
 
 void loop() {
+  esp_task_wdt_reset();
   ElegantOTA.loop();
+
+  // The main cycle runs here and not from a Ticker: Ticker callbacks run in the esp_timer task, where the
+  // blocking Influx HTTP calls are not allowed and are not covered by the loop watchdog.
+  unsigned long now = millis();
+  if (now - lastMainTask >= REFRESHTIME) {
+    lastMainTask = now;
+    MainTask();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    lastWifiOk = now;
+  } else if (now - lastWifiOk >= WIFI_DOWN_RESTART) {
+    D_println("WiFi down too long, restart");
+    ESP.restart();
+  }
+  if (now - lastInfluxOk >= INFLUX_DOWN_RESTART) {
+    D_println("No successful Influx write too long, restart");
+    ESP.restart();
+  }
+  delay(10);
 }
